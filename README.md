@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/ohhan777-korea-weather-badge.png)](https://mseep.ai/app/ohhan777-korea-weather)
+
 # Korea Weather MCP Server
 
 [![smithery badge](https://smithery.ai/badge/@ohhan777/korea_weather)](https://smithery.ai/server/@ohhan777/korea_weather)
