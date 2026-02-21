@@ -1,703 +1,406 @@
-from typing import Any
-import httpx
-from datetime import datetime, timedelta
+from __future__ import annotations
+
 import json
-import urllib.parse
 import math
-import asyncio
-from mcp.server.fastmcp import FastMCP
-from dotenv import load_dotenv
 import os
+import ssl
+import urllib.parse
+import urllib.request
+import urllib.error
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from functools import lru_cache
+from typing import Any
+
+try:
+    import httpx
+except ImportError:  # pragma: no cover - fallback path for minimal runtime envs
+    httpx = None
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency
+    def load_dotenv() -> None:
+        return None
+
+from mcp.server.fastmcp import FastMCP
 
 # Initialize FastMCP server
 mcp = FastMCP("korea_weather")
 
-# 만약 환경변수 KOREA_WEATHER_API_KEY가 없으면 data.or.kr에서 발급받은 날씨 API 키를 .env 파일에서 읽어온다
 if not os.getenv("KOREA_WEATHER_API_KEY"):
     load_dotenv()
-KOREA_WEATHER_API_KEY = os.getenv("KOREA_WEATHER_API_KEY")
 
-# Lambert Conformal Conic Projection 파라미터
+API_BASE = "https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0"
+TIMEOUT_SECONDS = 15.0
+
+PTY_MAP = {
+    0: "없음",
+    1: "비",
+    2: "비/눈",
+    3: "눈",
+    4: "소나기",
+    5: "빗방울",
+    6: "빗방울눈날림",
+    7: "눈날림",
+}
+SKY_MAP = {1: "맑음", 3: "구름많음", 4: "흐림"}
+DIRECTION_16 = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+DIRECTION_16_KR = ["북", "북북동", "북동", "동북동", "동", "동남동", "남동", "남남동", "남", "남남서", "남서", "서남서", "서", "서북서", "북서", "북북서"]
+
+
+@dataclass(frozen=True)
 class LambertConformalConic:
-    def __init__(self):
-        self.Re = 6371.00877    # 지구 반경(km)
-        self.grid = 5.0         # 격자 간격(km)
-        self.slat1 = 30.0       # 표준 위도 1
-        self.slat2 = 60.0       # 표준 위도 2
-        self.olon = 126.0       # 기준점 경도
-        self.olat = 38.0        # 기준점 위도
-        self.xo = 210/self.grid # 기준점 X좌표
-        self.yo = 675/self.grid # 기준점 Y좌표
-        self.first = True
-        
-        # 미리 계산할 상수들
-        if self.first:
-            self.PI = math.pi
-            self.DEGRAD = self.PI/180.0
-            self.RADDEG = 180.0/self.PI
-            
-            self.re = self.Re/self.grid
-            self.slat1_rad = self.slat1 * self.DEGRAD
-            self.slat2_rad = self.slat2 * self.DEGRAD
-            self.olon_rad = self.olon * self.DEGRAD
-            self.olat_rad = self.olat * self.DEGRAD
-            
-            self.sn = math.tan(self.PI * 0.25 + self.slat2_rad * 0.5) / math.tan(self.PI * 0.25 + self.slat1_rad * 0.5)
-            self.sn = math.log(math.cos(self.slat1_rad)/math.cos(self.slat2_rad)) / math.log(self.sn)
-            self.sf = math.tan(self.PI * 0.25 + self.slat1_rad * 0.5)
-            self.sf = math.pow(self.sf, self.sn) * math.cos(self.slat1_rad) / self.sn
-            self.ro = math.tan(self.PI * 0.25 + self.olat_rad * 0.5)
-            self.ro = self.re * self.sf / math.pow(self.ro, self.sn)
-            self.first = False
+    """Lambert Conformal Conic Projection parameters."""
 
-def convert_grid_gps(lon, lat, map_instance):
-    """
-    위경도 좌표를 기상청 격자 좌표로 변환
-    """
-    ra = math.tan(map_instance.PI * 0.25 + lat * map_instance.DEGRAD * 0.5)
-    ra = map_instance.re * map_instance.sf / math.pow(ra, map_instance.sn)
-    theta = lon * map_instance.DEGRAD - map_instance.olon_rad
-    
-    if theta > map_instance.PI:
-        theta -= 2.0 * map_instance.PI
-    if theta < -map_instance.PI:
-        theta += 2.0 * map_instance.PI
-        
-    theta *= map_instance.sn
-    
-    x = ra * math.sin(theta) + map_instance.xo
-    y = map_instance.ro - ra * math.cos(theta) + map_instance.yo
-    
+    re: float
+    slat1_rad: float
+    slat2_rad: float
+    olon_rad: float
+    sn: float
+    sf: float
+    ro: float
+    xo: float
+    yo: float
+    pi: float
+    degrad: float
+
+
+@lru_cache(maxsize=1)
+def get_projection() -> LambertConformalConic:
+    re_km = 6371.00877
+    grid = 5.0
+    slat1 = 30.0
+    slat2 = 60.0
+    olon = 126.0
+    olat = 38.0
+    xo = 210 / grid
+    yo = 675 / grid
+
+    pi = math.pi
+    degrad = pi / 180.0
+
+    re = re_km / grid
+    slat1_rad = slat1 * degrad
+    slat2_rad = slat2 * degrad
+    olon_rad = olon * degrad
+    olat_rad = olat * degrad
+
+    sn = math.tan(pi * 0.25 + slat2_rad * 0.5) / math.tan(pi * 0.25 + slat1_rad * 0.5)
+    sn = math.log(math.cos(slat1_rad) / math.cos(slat2_rad)) / math.log(sn)
+    sf = math.tan(pi * 0.25 + slat1_rad * 0.5)
+    sf = math.pow(sf, sn) * math.cos(slat1_rad) / sn
+    ro = math.tan(pi * 0.25 + olat_rad * 0.5)
+    ro = re * sf / math.pow(ro, sn)
+
+    return LambertConformalConic(
+        re=re,
+        slat1_rad=slat1_rad,
+        slat2_rad=slat2_rad,
+        olon_rad=olon_rad,
+        sn=sn,
+        sf=sf,
+        ro=ro,
+        xo=xo,
+        yo=yo,
+        pi=pi,
+        degrad=degrad,
+    )
+
+
+def get_grid_coordinate_from_lonlat(lon: float, lat: float) -> tuple[int, int]:
+    """위경도 좌표를 기상청 격자 좌표(nx, ny)로 변환합니다."""
+    proj = get_projection()
+
+    ra = math.tan(proj.pi * 0.25 + lat * proj.degrad * 0.5)
+    ra = proj.re * proj.sf / math.pow(ra, proj.sn)
+    theta = lon * proj.degrad - proj.olon_rad
+
+    if theta > proj.pi:
+        theta -= 2.0 * proj.pi
+    if theta < -proj.pi:
+        theta += 2.0 * proj.pi
+
+    theta *= proj.sn
+
+    x = ra * math.sin(theta) + proj.xo
+    y = proj.ro - ra * math.cos(theta) + proj.yo
     return int(x + 1.5), int(y + 1.5)
 
-def get_grid_coordinate_from_lonlat(lon, lat):
-    """
-    위경도 좌표를 입력받아 기상청 격자 좌표(nx, ny)를 반환합니다.
-    
-    Args:
-        lon (float): 경도 값
-        lat (float): 위도 값
-    
-    Returns:
-        tuple: (nx, ny) 격자 좌표
-    """
-    map_instance = LambertConformalConic()
-    nx, ny = convert_grid_gps(lon, lat, map_instance)
-    return nx, ny
 
-async def get_nowcast_observation_from_api(lon, lat) -> str:
-    """위경도 좌표의 현재 날씨 정보를 조회합니다.
+def _require_api_key() -> str:
+    api_key = os.getenv("KOREA_WEATHER_API_KEY")
+    if not api_key:
+        raise ValueError("KOREA_WEATHER_API_KEY 환경변수가 설정되어 있지 않습니다.")
+    return urllib.parse.unquote(api_key)
 
-    Args:
-        lon (float): 경도 값
-        lat (float): 위도 값
-        
-    Returns:
-        str: 날씨 정보 문자열
-    """
-    
-    try:
-        api_result = []
-        # 격자 좌표 조회
-        nx, ny = get_grid_coordinate_from_lonlat(lon, lat)
-        location_str = f"위도 {lat}, 경도 {lon}"
-        
-        # 기상청 API 키 (URL 디코딩)
-        api_key = urllib.parse.unquote(KOREA_WEATHER_API_KEY)
-        
-        # 현재 시간 정보 (매시각 40분 이후 호출가능)
-        now = datetime.now()
-        if now.minute < 40:  # 40분 이전이면 한 시간 전 데이터 사용
-            now = now - timedelta(hours=1)
-        base_date = now.strftime("%Y%m%d")
-        base_time = now.strftime("%H00")
 
-        # API 요청 URL
-        url = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getUltraSrtNcst"
-        params = {
-            'serviceKey': api_key,
-            'numOfRows': '10',
-            'pageNo': '1',
-            'dataType': 'JSON',
-            'base_date': base_date,
-            'base_time': base_time,
-            'nx': nx,
-            'ny': ny
-        }
+def _wind_direction(degree: float, labels: list[str]) -> str:
+    index = int((degree + 11.25) / 22.5) % 16
+    return labels[index]
 
-        # 비동기 HTTP 요청을 위해 httpx 사용
-        async with httpx.AsyncClient() as client:
+
+def _is_network_error(error: Exception) -> bool:
+    return isinstance(error, urllib.error.URLError) or (
+        httpx is not None and isinstance(error, httpx.RequestError)
+    )
+
+
+async def _fetch_weather(endpoint: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    url = f"{API_BASE}/{endpoint}"
+    if httpx is not None:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT_SECONDS)) as client:
             response = await client.get(url, params=params)
-            # api_result.append(f"API 응답 상태 코드: {response.status_code}\n")
-            
-            if response.status_code == 200:
-                result = response.json()
-                items = result['response']['body']['items']['item']
-                weather_data = {}
-                
-                for item in items:
-                    category = item['category']
-                    value = item['obsrValue']
-                    
-                    if category == 'T1H':  # 기온
-                        weather_data['temperature'] = f"{value}°C"
-                    elif category == 'RN1':  # 1시간 강수량
-                        weather_data['rainfall'] = f"{value}mm"
-                    elif category == 'REH':  # 습도
-                        weather_data['humidity'] = f"{value}%"
-                    elif category == 'WSD':  # 풍속
-                        weather_data['wind_speed'] = f"{value}m/s"
 
-                api_result.append(f"\n{location_str} 현재 날씨:")
-                api_result.append(f"기온: {weather_data.get('temperature', 'N/A')}\n")
-                api_result.append(f"강수량: {weather_data.get('rainfall', 'N/A')}\n")
-                api_result.append(f"습도: {weather_data.get('humidity', 'N/A')}\n")
-                api_result.append(f"풍속: {weather_data.get('wind_speed', 'N/A')}\n")
-                
-            else:
-                api_result.append(f"날씨 정보를 가져오는데 실패했습니다. 상태 코드: {response.status_code}\n")
-                
-    except ValueError as e:
-        api_result.append(f"오류: {e}\n")
-    except httpx.RequestError as e:
-        api_result.append(f"API 요청 중 오류 발생: {e}\n")
-    except json.JSONDecodeError as e:
-        api_result.append(f"JSON 파싱 중 오류 발생: {e}\n")
-    except Exception as e:
-        api_result.append(f"예상치 못한 오류 발생: {e}\n")
+        response.raise_for_status()
+        result = response.json()
+    else:
+        query = urllib.parse.urlencode(params)
+        request_url = f"{url}?{query}"
+        context = ssl.create_default_context()
+        with urllib.request.urlopen(request_url, timeout=TIMEOUT_SECONDS, context=context) as response:
+            result = json.loads(response.read().decode("utf-8"))
 
-    # 문자열 리스트를 하나의 문자열로 변환하여 반환
-    return "".join(api_result)
+    header = result.get("response", {}).get("header", {})
+    if header.get("resultCode") and header.get("resultCode") != "00":
+        raise ValueError(f"API 오류: {header.get('resultCode')} - {header.get('resultMsg', 'Unknown error')}")
 
-async def get_nowcast_forecast_from_api(lon, lat) -> str:
-    """위경도 좌표의 초단기 (6시간 이내) 예보 정보를 조회합니다.
+    return result.get("response", {}).get("body", {}).get("items", {}).get("item", [])
 
-    Args:
-        lon (float): 경도 값
-        lat (float): 위도 값
-        
-    Returns:
-        str: 초단기 예보 정보 문자열
-    """
-    
+
+async def get_nowcast_observation_from_api(lon: float, lat: float) -> str:
     try:
-        api_result = []
-        # 격자 좌표 조회
         nx, ny = get_grid_coordinate_from_lonlat(lon, lat)
-        location_str = f"위도 {lat}, 경도 {lon}"
-        
-        # 기상청 API 키 (URL 디코딩)
-        api_key = urllib.parse.unquote(KOREA_WEATHER_API_KEY)
-        
-        # 현재 시간 정보 (매시각 30분 이후 호출가능)
         now = datetime.now()
-        # 45분 이전이면 한 시간 전 데이터 사용 (API는 매시간 30분에 생성되고 45분 이후 호출 가능)
+        if now.minute < 40:
+            now -= timedelta(hours=1)
+
+        items = await _fetch_weather(
+            "getUltraSrtNcst",
+            {
+                "serviceKey": _require_api_key(),
+                "numOfRows": "10",
+                "pageNo": "1",
+                "dataType": "JSON",
+                "base_date": now.strftime("%Y%m%d"),
+                "base_time": now.strftime("%H00"),
+                "nx": nx,
+                "ny": ny,
+            },
+        )
+
+        weather_data: dict[str, str] = {}
+        for item in items:
+            category = item.get("category")
+            value = item.get("obsrValue")
+            if category == "T1H":
+                weather_data["temperature"] = f"{value}°C"
+            elif category == "RN1":
+                weather_data["rainfall"] = f"{value}mm"
+            elif category == "REH":
+                weather_data["humidity"] = f"{value}%"
+            elif category == "WSD":
+                weather_data["wind_speed"] = f"{value}m/s"
+
+        return (
+            f"\n위도 {lat}, 경도 {lon} 현재 날씨:\n"
+            f"기온: {weather_data.get('temperature', 'N/A')}\n"
+            f"강수량: {weather_data.get('rainfall', 'N/A')}\n"
+            f"습도: {weather_data.get('humidity', 'N/A')}\n"
+            f"풍속: {weather_data.get('wind_speed', 'N/A')}\n"
+        )
+    except ValueError as e:
+        return f"오류: {e}\n"
+    except json.JSONDecodeError as e:
+        return f"JSON 파싱 중 오류 발생: {e}\n"
+    except Exception as e:
+        if _is_network_error(e):
+            return f"API 요청 중 오류 발생: {e}\n"
+        return f"예상치 못한 오류 발생: {e}\n"
+
+
+async def get_nowcast_forecast_from_api(lon: float, lat: float) -> str:
+    try:
+        nx, ny = get_grid_coordinate_from_lonlat(lon, lat)
+        now = datetime.now()
         if now.minute < 45:
-            now = now - timedelta(hours=1)
-            
+            now -= timedelta(hours=1)
+
         base_date = now.strftime("%Y%m%d")
-        base_time = now.strftime("%H30")  # 매시간 30분 발표
+        base_time = now.strftime("%H30")
+        items = await _fetch_weather(
+            "getUltraSrtFcst",
+            {
+                "serviceKey": _require_api_key(),
+                "numOfRows": "60",
+                "pageNo": "1",
+                "dataType": "JSON",
+                "base_date": base_date,
+                "base_time": base_time,
+                "nx": nx,
+                "ny": ny,
+            },
+        )
 
-        # API 요청 URL
-        url = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getUltraSrtFcst"
-        params = {
-            'serviceKey': api_key,
-            'numOfRows': '60',  # 시간당 10개 요소 * 6시간 예보
-            'pageNo': '1',
-            'dataType': 'JSON',
-            'base_date': base_date,
-            'base_time': base_time,
-            'nx': nx,
-            'ny': ny
-        }
+        grouped: dict[str, dict[str, str]] = {}
+        for item in items:
+            time_key = f"{item['fcstDate']} {item['fcstTime']}"
+            grouped.setdefault(time_key, {})[item["category"]] = item["fcstValue"]
 
-        # 비동기 HTTP 요청을 위해 httpx 사용
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, params=params)
-            # api_result.append(f"API 응답 상태 코드: {response.status_code}\n")
-            
-            if response.status_code == 200:
-                result = response.json()
-                # API 응답 체크
-                if 'response' in result and 'body' in result['response'] and 'items' in result['response']['body']:
-                    items = result['response']['body']['items']['item']
-                    
-                    # 예보 시간별로 데이터 그룹화
-                    forecast_by_time = {}
-                    for item in items:
-                        fcst_date = item['fcstDate']
-                        fcst_time = item['fcstTime']
-                        category = item['category']
-                        value = item['fcstValue']
-                        
-                        time_key = f"{fcst_date} {fcst_time}"
-                        if time_key not in forecast_by_time:
-                            forecast_by_time[time_key] = {}
-                            
-                        forecast_by_time[time_key][category] = value
-                    
-                    # 헤더 정보 추가
-                    # 발표 시간 형식 변경 {base_date} {base_time} -> XXXX년 MM월 DD일 HH:MM
-                    base_date_str = base_date[:4] + "년 " + base_date[4:6] + "월 " + base_date[6:] + "일 " + base_time[:2] + ":" + base_time[2:] + "시"
-                    api_result.append(f"\n{location_str} 초단기 예보 (발표: {base_date_str})\n")
-                    api_result.append("=" * 50 + "\n")
-                    
-                    # 시간순으로 정렬
-                    sorted_times = sorted(forecast_by_time.keys())
-                    
-                    # 각 시간대별 예보 정보 출력
-                    for time_key in sorted_times:
-                        fcst_data = forecast_by_time[time_key]
-                        # date_str 형식 변경 {base_date} {base_time} -> XXXX년 MM월 DD일
-                        date_str = base_date[:4] + "년 " + base_date[4:6] + "월 " + base_date[6:] + "일"
-                        time_str = time_key[9:]
-                        formatted_time = f"{time_str[:2]}:{time_str[2:]}시"
-                        
-                        api_result.append(f"■ {date_str} {formatted_time} 예보\n")
-                        
-                        # 기온
-                        if 'T1H' in fcst_data:
-                            api_result.append(f"  기온: {fcst_data['T1H']}°C\n")
-                        
-                        # 강수형태
-                        if 'PTY' in fcst_data:
-                            pty_code = int(fcst_data['PTY'])
-                            pty_str = "없음"
-                            if pty_code == 1:
-                                pty_str = "비"
-                            elif pty_code == 2:
-                                pty_str = "비/눈"
-                            elif pty_code == 3:
-                                pty_str = "눈"
-                            elif pty_code == 5:
-                                pty_str = "빗방울"
-                            elif pty_code == 6:
-                                pty_str = "빗방울눈날림"
-                            elif pty_code == 7:
-                                pty_str = "눈날림"
-                            api_result.append(f"  강수형태: {pty_str}\n")
-                        
-                        # 강수량
-                        if 'RN1' in fcst_data:
-                            rain_value = fcst_data['RN1']
-                            if rain_value == '강수없음':
-                                api_result.append(f"  1시간 강수량: 없음\n")
-                            else:
-                                api_result.append(f"  1시간 강수량: {rain_value}\n")
-                        
-                        # 습도
-                        if 'REH' in fcst_data:
-                            api_result.append(f"  습도: {fcst_data['REH']}%\n")
-                        
-                        # 하늘상태
-                        if 'SKY' in fcst_data:
-                            sky_code = int(fcst_data['SKY'])
-                            sky_str = "알 수 없음"
-                            if sky_code == 1:
-                                sky_str = "맑음"
-                            elif sky_code == 3:
-                                sky_str = "구름많음"
-                            elif sky_code == 4:
-                                sky_str = "흐림"
-                            api_result.append(f"  하늘상태: {sky_str}\n")
-                        
-                        # 풍속
-                        if 'WSD' in fcst_data:
-                            api_result.append(f"  풍속: {fcst_data['WSD']}m/s\n")
-                        
-                        # 풍향
-                        if 'VEC' in fcst_data:
-                            vec_value = float(fcst_data['VEC'])
-                            # 16방위 변환
-                            vec_dir = int((vec_value + 22.5 * 0.5) / 22.5) % 16
-                            dir_str = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", 
-                                       "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"][vec_dir]
-                            api_result.append(f"  풍향: {dir_str} ({fcst_data['VEC']}°)\n")
-                        
-                        # 낙뢰
-                        if 'LGT' in fcst_data:
-                            lgt_value = int(fcst_data['LGT'])
-                            lgt_str = "없음" if lgt_value == 0 else f"{lgt_value} kA/㎢"
-                            api_result.append(f"  낙뢰: {lgt_str}\n")
-                        
-                        api_result.append("\n")
-                else:
-                    api_result.append(f"API 응답에서 데이터를 찾을 수 없습니다.\n")
-                    if 'response' in result and 'header' in result['response']:
-                        header = result['response']['header']
-                        if 'resultCode' in header and 'resultMsg' in header:
-                            api_result.append(f"결과 코드: {header['resultCode']}\n")
-                            api_result.append(f"결과 메시지: {header['resultMsg']}\n")
-            else:
-                api_result.append(f"날씨 정보를 가져오는데 실패했습니다. 상태 코드: {response.status_code}\n")
-                if response.status_code == 529:
-                    api_result.append("서버가 과부하 상태입니다. 잠시 후 다시 시도해주세요.\n")
-                
+        lines = [
+            f"\n위도 {lat}, 경도 {lon} 초단기 예보 (발표: {base_date[:4]}년 {base_date[4:6]}월 {base_date[6:]}일 {base_time[:2]}:{base_time[2:]}시)",
+            "=" * 50,
+        ]
+
+        for time_key in sorted(grouped):
+            fcst_data = grouped[time_key]
+            date_str = f"{time_key[:4]}년 {time_key[4:6]}월 {time_key[6:8]}일"
+            hhmm = time_key[9:]
+            lines.append(f"■ {date_str} {hhmm[:2]}:{hhmm[2:]}시 예보")
+
+            if "T1H" in fcst_data:
+                lines.append(f"  기온: {fcst_data['T1H']}°C")
+            if "PTY" in fcst_data:
+                lines.append(f"  강수형태: {PTY_MAP.get(int(fcst_data['PTY']), '알 수 없음')}")
+            if "RN1" in fcst_data:
+                lines.append(f"  1시간 강수량: {'없음' if fcst_data['RN1'] == '강수없음' else fcst_data['RN1']}")
+            if "REH" in fcst_data:
+                lines.append(f"  습도: {fcst_data['REH']}%")
+            if "SKY" in fcst_data:
+                lines.append(f"  하늘상태: {SKY_MAP.get(int(fcst_data['SKY']), '알 수 없음')}")
+            if "WSD" in fcst_data:
+                lines.append(f"  풍속: {fcst_data['WSD']}m/s")
+            if "VEC" in fcst_data:
+                lines.append(f"  풍향: {_wind_direction(float(fcst_data['VEC']), DIRECTION_16)} ({fcst_data['VEC']}°)")
+            if "LGT" in fcst_data:
+                lgt_value = int(fcst_data["LGT"])
+                lines.append(f"  낙뢰: {'없음' if lgt_value == 0 else f'{lgt_value} kA/㎢'}")
+
+            lines.append("")
+
+        return "\n".join(lines)
     except ValueError as e:
-        api_result.append(f"오류: {e}\n")
-    except httpx.RequestError as e:
-        api_result.append(f"API 요청 중 오류 발생: {e}\n")
+        return f"오류: {e}\n"
     except json.JSONDecodeError as e:
-        api_result.append(f"JSON 파싱 중 오류 발생: {e}\n")
+        return f"JSON 파싱 중 오류 발생: {e}\n"
     except Exception as e:
-        api_result.append(f"예상치 못한 오류 발생: {e}\n")
+        if _is_network_error(e):
+            return f"API 요청 중 오류 발생: {e}\n"
+        return f"예상치 못한 오류 발생: {e}\n"
 
-    # 문자열 리스트를 하나의 문자열로 변환하여 반환
-    return "".join(api_result)
 
-async def get_short_term_forecast_from_api(lon, lat) -> str:
-    """위경도 좌표의 단기 예보 (3일~5일) 정보를 조회합니다.
-
-    Args:
-        lon (float): 경도 값
-        lat (float): 위도 값
-        
-    Returns:
-        str: 단기 예보 (3일~5일) 정보 문자열
-    """
-    
+async def get_short_term_forecast_from_api(lon: float, lat: float) -> str:
     try:
-        api_result = []
-        # 격자 좌표 조회
         nx, ny = get_grid_coordinate_from_lonlat(lon, lat)
-        location_str = f"위도 {lat}, 경도 {lon}"
-        
-        # 기상청 API 키 (URL 디코딩)
-        api_key = urllib.parse.unquote(KOREA_WEATHER_API_KEY)
-        
-        # 현재 시간 정보
         now = datetime.now()
-        
-        # 발표시각 결정 (0200, 0500, 0800, 1100, 1400, 1700, 2000, 2300)
-        base_times = ['0200', '0500', '0800', '1100', '1400', '1700', '2000', '2300']
-        current_hour = int(now.strftime('%H'))
-        
-        # 가장 최근 발표시각 찾기 (발표 후 10분 소요 감안)
+        base_times = ["0200", "0500", "0800", "1100", "1400", "1700", "2000", "2300"]
+
         available_time = None
         for bt in base_times:
             bt_hour = int(bt[:2])
-            if current_hour > bt_hour or (current_hour == bt_hour and now.minute >= 10):
+            if now.hour > bt_hour or (now.hour == bt_hour and now.minute >= 10):
                 available_time = bt
-        
-        # 만약 당일 발표된 예보가 없으면 전날 마지막 예보 사용
+
         if available_time is None:
-            available_time = '2300'
-            now = now - timedelta(days=1)
-            
+            available_time = "2300"
+            now -= timedelta(days=1)
+
         base_date = now.strftime("%Y%m%d")
-        base_time = available_time
+        items = await _fetch_weather(
+            "getVilageFcst",
+            {
+                "serviceKey": _require_api_key(),
+                "numOfRows": "1000",
+                "pageNo": "1",
+                "dataType": "JSON",
+                "base_date": base_date,
+                "base_time": available_time,
+                "nx": nx,
+                "ny": ny,
+            },
+        )
 
-        # API 요청 URL
-        url = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst"
-        params = {
-            'serviceKey': api_key,
-            'numOfRows': '1000',  # 충분한 데이터 요청 (최대 3일치 예보)
-            'pageNo': '1',
-            'dataType': 'JSON',
-            'base_date': base_date,
-            'base_time': base_time,
-            'nx': nx,
-            'ny': ny
-        }
+        by_date_time: dict[str, dict[str, dict[str, str]]] = {}
+        for item in items:
+            fcst_date = item["fcstDate"]
+            fcst_time = item["fcstTime"]
+            by_date_time.setdefault(fcst_date, {}).setdefault(fcst_time, {})[item["category"]] = item["fcstValue"]
 
-        # 비동기 HTTP 요청을 위해 httpx 사용
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, params=params)
-            # api_result.append(f"API 응답 상태 코드: {response.status_code}\n")
-            
-            if response.status_code == 200:
-                result = response.json()
-                # API 응답 체크
-                if 'response' in result and 'body' in result['response'] and 'items' in result['response']['body']:
-                    items = result['response']['body']['items']['item']
-                    total_count = result['response']['body']['totalCount']
-                    
-                    # 날짜 및 시간별로 데이터 그룹화
-                    forecast_by_date_time = {}
-                    for item in items:
-                        fcst_date = item['fcstDate']
-                        fcst_time = item['fcstTime']
-                        category = item['category']
-                        value = item['fcstValue']
-                        
-                        # 날짜별 그룹화
-                        if fcst_date not in forecast_by_date_time:
-                            forecast_by_date_time[fcst_date] = {}
-                        
-                        # 시간별 그룹화
-                        time_key = fcst_time
-                        if time_key not in forecast_by_date_time[fcst_date]:
-                            forecast_by_date_time[fcst_date][time_key] = {}
-                            
-                        forecast_by_date_time[fcst_date][time_key][category] = value
-                    
-                    # 헤더 정보 추가
-                    api_result.append(f"\n{location_str} 단기 예보 (발표: {base_date} {base_time})\n")
-                    api_result.append(f"총 {total_count}개 데이터 조회\n")
-                    api_result.append("=" * 50 + "\n")
-                    
-                    # 날짜별 처리
-                    for fcst_date in sorted(forecast_by_date_time.keys()):
-                        # 날짜 포맷팅 (YYYYMMDD -> YYYY년 MM월 DD일)
-                        formatted_date = f"{fcst_date[:4]}년 {fcst_date[4:6]}월 {fcst_date[6:]}일"
-                        api_result.append(f"\n【 {formatted_date} 예보 】\n")
-                        
-                        # 일 최고/최저기온 찾기
-                        tmn, tmx = None, None
-                        for time_data in forecast_by_date_time[fcst_date].values():
-                            if 'TMN' in time_data and time_data['TMN'] != '':
-                                tmn = time_data['TMN']
-                            if 'TMX' in time_data and time_data['TMX'] != '':
-                                tmx = time_data['TMX']
-                        
-                        # 일 최고/최저기온 출력
-                        if tmn is not None:
-                            api_result.append(f"  ▶ 최저기온: {tmn}°C\n")
-                        if tmx is not None:
-                            api_result.append(f"  ▶ 최고기온: {tmx}°C\n")
-                        
-                        api_result.append("\n  시간별 예보:\n")
-                        
-                        # 시간별 예보 처리
-                        for fcst_time in sorted(forecast_by_date_time[fcst_date].keys()):
-                            # 오전/오후 표시를 위한 시간 변환
-                            hour = int(fcst_time[:2])
-                            am_pm = "오전" if hour < 12 else "오후"
-                            display_hour = hour if hour <= 12 else hour - 12
-                            if hour == 0:
-                                display_hour = 12
-                                am_pm = "오전"
-                            
-                            formatted_time = f"{am_pm} {display_hour}시"
-                            time_data = forecast_by_date_time[fcst_date][fcst_time]
-                            
-                            # 주요 날씨 정보 수집
-                            weather_info = []
-                            
-                            # 기온
-                            if 'TMP' in time_data:
-                                weather_info.append(f"기온 {time_data['TMP']}°C")
-                            
-                            # 강수확률
-                            if 'POP' in time_data:
-                                weather_info.append(f"강수확률 {time_data['POP']}%")
-                            
-                            # 강수형태
-                            if 'PTY' in time_data:
-                                pty_code = int(time_data['PTY'])
-                                pty_str = ""
-                                if pty_code == 1:
-                                    pty_str = "비"
-                                elif pty_code == 2:
-                                    pty_str = "비/눈"
-                                elif pty_code == 3:
-                                    pty_str = "눈"
-                                elif pty_code == 4:
-                                    pty_str = "소나기"
-                                
-                                if pty_str:
-                                    weather_info.append(f"{pty_str}")
-                            
-                            # 강수량
-                            if 'PCP' in time_data:
-                                pcp_value = time_data['PCP']
-                                if pcp_value != "강수없음" and pcp_value != "":
-                                    weather_info.append(f"강수량 {pcp_value}")
-                            
-                            # 신적설
-                            if 'SNO' in time_data:
-                                sno_value = time_data['SNO']
-                                if sno_value != "적설없음" and sno_value != "":
-                                    weather_info.append(f"적설 {sno_value}")
-                            
-                            # 하늘상태
-                            if 'SKY' in time_data:
-                                sky_code = int(time_data['SKY'])
-                                sky_str = ""
-                                if sky_code == 1:
-                                    sky_str = "맑음"
-                                elif sky_code == 3:
-                                    sky_str = "구름많음"
-                                elif sky_code == 4:
-                                    sky_str = "흐림"
-                                
-                                if sky_str:
-                                    weather_info.append(f"{sky_str}")
-                            
-                            # 습도
-                            if 'REH' in time_data:
-                                weather_info.append(f"습도 {time_data['REH']}%")
-                            
-                            # 풍속과 풍향
-                            wind_info = []
-                            
-                            if 'VEC' in time_data and 'WSD' in time_data:
-                                vec_value = float(time_data['VEC'])
-                                wsd_value = float(time_data['WSD'])
-                                
-                                # 풍향 변환 (16방위)
-                                vec_dir = int((vec_value + 22.5 * 0.5) / 22.5) % 16
-                                dir_names = ["북", "북북동", "북동", "동북동", "동", "동남동", "남동", "남남동", 
-                                           "남", "남남서", "남서", "서남서", "서", "서북서", "북서", "북북서"]
-                                dir_str = dir_names[vec_dir]
-                                
-                                # 풍속 해석
-                                wind_desc = ""
-                                if wsd_value < 4:
-                                    wind_desc = "약한 바람"
-                                elif wsd_value < 9:
-                                    wind_desc = "약간 강한 바람"
-                                else:
-                                    wind_desc = "강한 바람"
-                                
-                                wind_info.append(f"{dir_str}풍 {wind_desc}({wsd_value}m/s)")
-                            
-                            # 출력
-                            api_result.append(f"  ■ {formatted_time}: {', '.join(weather_info)}\n")
-                            if wind_info:
-                                api_result.append(f"    - {', '.join(wind_info)}\n")
-                else:
-                    api_result.append(f"API 응답에서 데이터를 찾을 수 없습니다.\n")
-                    if 'response' in result and 'header' in result['response']:
-                        header = result['response']['header']
-                        if 'resultCode' in header and 'resultMsg' in header:
-                            api_result.append(f"결과 코드: {header['resultCode']}\n")
-                            api_result.append(f"결과 메시지: {header['resultMsg']}\n")
-            else:
-                api_result.append(f"날씨 정보를 가져오는데 실패했습니다. 상태 코드: {response.status_code}\n")
-                if response.status_code == 529:
-                    api_result.append("서버가 과부하 상태입니다. 잠시 후 다시 시도해주세요.\n")
-                
+        lines = [
+            f"\n위도 {lat}, 경도 {lon} 단기 예보 (발표: {base_date} {available_time})",
+            f"총 {len(items)}개 데이터 조회",
+            "=" * 50,
+        ]
+
+        for fcst_date in sorted(by_date_time):
+            lines.append(f"\n【 {fcst_date[:4]}년 {fcst_date[4:6]}월 {fcst_date[6:]}일 예보 】")
+            day_values = by_date_time[fcst_date].values()
+            tmn = next((data["TMN"] for data in day_values if data.get("TMN")), None)
+            day_values = by_date_time[fcst_date].values()
+            tmx = next((data["TMX"] for data in day_values if data.get("TMX")), None)
+            if tmn:
+                lines.append(f"  ▶ 최저기온: {tmn}°C")
+            if tmx:
+                lines.append(f"  ▶ 최고기온: {tmx}°C")
+
+            lines.append("\n  시간별 예보:")
+            for fcst_time in sorted(by_date_time[fcst_date]):
+                hour = int(fcst_time[:2])
+                am_pm = "오전" if hour < 12 else "오후"
+                display_hour = 12 if hour == 0 else (hour if hour <= 12 else hour - 12)
+                formatted_time = f"{am_pm} {display_hour}시"
+                time_data = by_date_time[fcst_date][fcst_time]
+
+                weather_info: list[str] = []
+                if "TMP" in time_data:
+                    weather_info.append(f"기온 {time_data['TMP']}°C")
+                if "POP" in time_data:
+                    weather_info.append(f"강수확률 {time_data['POP']}%")
+                if "PTY" in time_data and int(time_data["PTY"]) in PTY_MAP and int(time_data["PTY"]) != 0:
+                    weather_info.append(PTY_MAP[int(time_data["PTY"])])
+                if "PCP" in time_data and time_data["PCP"] not in {"", "강수없음"}:
+                    weather_info.append(f"강수량 {time_data['PCP']}")
+                if "SNO" in time_data and time_data["SNO"] not in {"", "적설없음"}:
+                    weather_info.append(f"적설 {time_data['SNO']}")
+                if "SKY" in time_data and int(time_data["SKY"]) in SKY_MAP:
+                    weather_info.append(SKY_MAP[int(time_data["SKY"])])
+                if "REH" in time_data:
+                    weather_info.append(f"습도 {time_data['REH']}%")
+
+                lines.append(f"  ■ {formatted_time}: {', '.join(weather_info)}")
+
+                if "VEC" in time_data and "WSD" in time_data:
+                    wsd = float(time_data["WSD"])
+                    wind_desc = "약한 바람" if wsd < 4 else "약간 강한 바람" if wsd < 9 else "강한 바람"
+                    lines.append(
+                        f"    - {_wind_direction(float(time_data['VEC']), DIRECTION_16_KR)}풍 {wind_desc}({wsd}m/s)"
+                    )
+
+        return "\n".join(lines)
     except ValueError as e:
-        api_result.append(f"오류: {e}\n")
-    except httpx.RequestError as e:
-        api_result.append(f"API 요청 중 오류 발생: {e}\n")
+        return f"오류: {e}\n"
     except json.JSONDecodeError as e:
-        api_result.append(f"JSON 파싱 중 오류 발생: {e}\n")
+        return f"JSON 파싱 중 오류 발생: {e}\n"
     except Exception as e:
-        api_result.append(f"예상치 못한 오류 발생: {e}\n")
+        if _is_network_error(e):
+            return f"API 요청 중 오류 발생: {e}\n"
+        return f"예상치 못한 오류 발생: {e}\n"
 
-    # 문자열 리스트를 하나의 문자열로 변환하여 반환
-    return "".join(api_result)
 
-
-@mcp.tool()    
+@mcp.tool(description="특정 좌표의 현재 관측 날씨를 조회합니다.")
 async def get_nowcast_observation(lon: float, lat: float) -> str:
-    """특정 위경도의 날씨 정보를 가져옵니다.
-    
-    Args:
-        lon (float): 경도 값
-        lat (float): 위도 값
-    """
-    response = await get_nowcast_observation_from_api(lon, lat)
-    return response
+    return await get_nowcast_observation_from_api(lon, lat)
 
 
-@mcp.tool()
-async def get_short_term_forecast(lon: float, lat: float) -> str:
-    """특정 위경도의 단기 예보 (3일~5일) 정보를 가져옵니다.
-    
-    Args:
-        lon (float): 경도 값
-        lat (float): 위도 값
-        
-    Returns:
-        str: 단기 예보 정보 문자열 (최대 3일 예보)
-    """
-    response = await get_short_term_forecast_from_api(lon, lat)
-    return response
-
-
-@mcp.tool()
+@mcp.tool(description="특정 좌표의 초단기(6시간) 예보를 조회합니다.")
 async def get_nowcast_forecast(lon: float, lat: float) -> str:
-    """특정 위경도의 초단기 (6시간 이내) 예보 정보를 가져옵니다.
-    
-    Args:
-        lon (float): 경도 값
-        lat (float): 위도 값
-        
-    Returns:
-        str: 초단기 (6시간 이내) 예보 정보 문자열
-    """
-    response = await get_nowcast_forecast_from_api(lon, lat)
-    return response
+    return await get_nowcast_forecast_from_api(lon, lat)
 
 
-# @mcp.tool()
-# async def get_alerts(state: str) -> str:
-#     """Get weather alerts for a US state.
+@mcp.tool(description="특정 좌표의 단기(3~5일) 예보를 조회합니다.")
+async def get_short_term_forecast(lon: float, lat: float) -> str:
+    return await get_short_term_forecast_from_api(lon, lat)
 
-#     Args:
-#         state: Two-letter US state code (e.g. CA, NY)
-#     """
-#     url = f"{NWS_API_BASE}/alerts/active/area/{state}"
-#     data = await make_nws_request(url)
-
-#     if not data or "features" not in data:
-#         return "Unable to fetch alerts or no alerts found."
-
-#     if not data["features"]:
-#         return "No active alerts for this state."
-
-#     alerts = [format_alert(feature) for feature in data["features"]]
-#     return "\n---\n".join(alerts)
-
-# @mcp.tool()
-# async def get_forecast(latitude: float, longitude: float) -> str:
-#     """Get weather forecast for a location.
-
-#     Args:
-#         latitude: Latitude of the location
-#         longitude: Longitude of the location
-#     """
-#     # First get the forecast grid endpoint
-#     points_url = f"{NWS_API_BASE}/points/{latitude},{longitude}"
-#     points_data = await make_nws_request(points_url)
-
-#     if not points_data:
-#         return "Unable to fetch forecast data for this location."
-
-#     # Get the forecast URL from the points response
-#     forecast_url = points_data["properties"]["forecast"]
-#     forecast_data = await make_nws_request(forecast_url)
-
-#     if not forecast_data:
-#         return "Unable to fetch detailed forecast."
-
-#     # Format the periods into a readable forecast
-#     periods = forecast_data["properties"]["periods"]
-#     forecasts = []
-#     for period in periods[:5]:  # Only show next 5 periods
-#         forecast = f"""
-# {period['name']}:
-# Temperature: {period['temperature']}°{period['temperatureUnit']}
-# Wind: {period['windSpeed']} {period['windDirection']}
-# Forecast: {period['detailedForecast']}
-# """
-#         forecasts.append(forecast)
-
-#     return "\n---\n".join(forecasts)
-
-# async def main():
-#     """사용자로부터 위경도 좌표를 입력받아 날씨 정보를 조회합니다."""
-#     print("위경도 좌표를 입력해주세요.")
-#     try:
-#         lon = float(input("경도 (예: 127.1234): ").strip())
-#         lat = float(input("위도 (예: 37.5678): ").strip())
-        
-#         # 한반도 영역 검사 (대략적인 범위)
-#         if not (124 <= lon <= 132):
-#             print("경도가 한반도 영역을 벗어났습니다. (124 ~ 132)")
-#             return
-#         if not (33 <= lat <= 43):
-#             print("위도가 한반도 영역을 벗어났습니다. (33 ~ 43)")
-#             return
-            
-#         response = await get_weather(lon, lat)
-#         print(response)
-#     except ValueError:
-#         print("잘못된 입력입니다. 숫자 형식으로 입력해주세요.")
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
-    # asyncio.run(main()) 

@@ -25,9 +25,10 @@
    설치 과정에서 API 키 입력을 요구하면 발급받은 키를 입력합니다.
    ```bash
    npx -y @smithery/cli install @ohhan777/korea_weather --client claude
+   ```
 3. Claude Desktop을 재시작하여 사용하면 됩니다.
 
-### Github에서 직접 설치하는 방법
+### GitHub에서 직접 설치하는 방법
 1. [data.go.kr](https://www.data.go.kr/)에서 기상청 단기예보 API 활용 신청 후 API 키를 발급받습니다.
 2. [github](https://github.com/ohhan777/korea_weather)에서 소스코드를 다운받아 실행해봅니다.
    ```
@@ -81,3 +82,9 @@
 ## 문의
 
 개발자: 한국항공우주연구원 오한 (ohhan@kari.re.kr)
+
+
+## 수정 이력
+- 2026-02: 서버 구조를 리팩터링하고(공통 API 요청 처리, 좌표 변환 캐시), MCP 도구 설명을 보강했습니다.
+- 2026-02: `httpx`/`dotenv` 미설치 환경에서도 동작하도록 표준 라이브러리 기반 HTTP fallback 경로를 추가했습니다.
+- 2026-02: 오프라인 환경에서도 실행 가능한 단위 테스트(`tests/test_korea_weather.py`)를 추가했습니다.
