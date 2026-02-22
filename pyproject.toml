@@ -1,10 +1,21 @@
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "korea-weather"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "Korea Weather MCP Server - 기상청 단기예보 API 기반 MCP 서버"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",
-    "mcp[cli]>=1.6.0",
+    "mcp[cli]>=1.14.1",
+    "smithery>=0.2.4",
 ]
+
+[tool.setuptools]
+py-modules = ["korea_weather"]
+
+[tool.smithery]
+server = "korea_weather:create_server"

@@ -25,9 +25,6 @@ except ImportError:  # pragma: no cover - optional dependency
 
 from mcp.server.fastmcp import FastMCP
 
-# Initialize FastMCP server
-mcp = FastMCP("korea_weather")
-
 if not os.getenv("KOREA_WEATHER_API_KEY"):
     load_dotenv()
 
@@ -387,20 +384,25 @@ async def get_short_term_forecast_from_api(lon: float, lat: float) -> str:
         return f"예상치 못한 오류 발생: {e}\n"
 
 
-@mcp.tool(description="특정 좌표의 현재 관측 날씨를 조회합니다.")
-async def get_nowcast_observation(lon: float, lat: float) -> str:
-    return await get_nowcast_observation_from_api(lon, lat)
+def create_server() -> FastMCP:
+    """Create and return the Korea Weather MCP server instance."""
+    mcp = FastMCP("korea_weather")
 
+    @mcp.tool(description="특정 좌표의 현재 관측 날씨를 조회합니다.")
+    async def get_nowcast_observation(lon: float, lat: float) -> str:
+        return await get_nowcast_observation_from_api(lon, lat)
 
-@mcp.tool(description="특정 좌표의 초단기(6시간) 예보를 조회합니다.")
-async def get_nowcast_forecast(lon: float, lat: float) -> str:
-    return await get_nowcast_forecast_from_api(lon, lat)
+    @mcp.tool(description="특정 좌표의 초단기(6시간) 예보를 조회합니다.")
+    async def get_nowcast_forecast(lon: float, lat: float) -> str:
+        return await get_nowcast_forecast_from_api(lon, lat)
 
+    @mcp.tool(description="특정 좌표의 단기(3~5일) 예보를 조회합니다.")
+    async def get_short_term_forecast(lon: float, lat: float) -> str:
+        return await get_short_term_forecast_from_api(lon, lat)
 
-@mcp.tool(description="특정 좌표의 단기(3~5일) 예보를 조회합니다.")
-async def get_short_term_forecast(lon: float, lat: float) -> str:
-    return await get_short_term_forecast_from_api(lon, lat)
+    return mcp
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    server = create_server()
+    server.run(transport="stdio")
